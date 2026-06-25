@@ -155,6 +155,7 @@ export class ToolRegistry {
     }
 
     if (!(await this.ensureApproval(definition, toolName, args, approvalCallback))) {
+      console.error("User denied approval for this tool call.", toolName, args);
       return jsonDumpsSafe({ error: "User denied approval for this tool call." });
     }
 
