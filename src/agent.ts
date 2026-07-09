@@ -7,6 +7,8 @@ import {
   AgentOptions,
   ChatMessage,
   ChatMessageContent,
+  ElicitationRequest,
+  ElicitationResult,
   OpenAIInputContentPart,
   OpenAIToolCall,
   ToolHandler,
@@ -171,6 +173,7 @@ export class Agent {
   private readonly timeout: number;
   private readonly debug: DebugLogger;
   private readonly approvalCallback?: AgentOptions["approvalCallback"];
+  private readonly elicitationCallback?: AgentOptions["elicitationCallback"];
   private readonly maxToolRounds: number;
   private readonly eventBaseUrl: string;
   private readonly eventApiKey: string;
@@ -209,6 +212,7 @@ export class Agent {
     this.debugEnabled = Boolean(options.debug);
     this.timeout = timeoutMs;
     this.approvalCallback = options.approvalCallback;
+    this.elicitationCallback = options.elicitationCallback;
     this.maxToolRounds = maxToolRounds;
     this.sessionId = randomUUID();
     this.eventBaseUrl = agentblitUrl;
@@ -523,15 +527,41 @@ export class Agent {
             tool_calls: toolCalls,
           });
 
+          // Wrap elicitationCallback to emit elicitation_request / elicitation_response
+          // events so analytics can separate user think-time from tool execution time.
+          const instrumentedElicitationCallback = this.elicitationCallback
+            ? async (toolName: string, request: ElicitationRequest): Promise<ElicitationResult> => {
+                const elicitStartedAt = Date.now();
+                events.push(
+                  this.makeEvent({
+                    eventType: "elicitation_request",
+                    data: { tool_name: toolName, request },
+                  }),
+                );
+                const result = await this.elicitationCallback!(toolName, request);
+                events.push(
+                  this.makeEvent({
+                    eventType: "elicitation_response",
+                    data: { tool_name: toolName, result },
+                    latencyMs: Date.now() - elicitStartedAt,
+                  }),
+                );
+                return result;
+              }
+            : undefined;
+
+          const batchStartedAt = Date.now();
+          const toolResults = await this.tools.executeBatch(
+            toolCalls,
+            this.approvalCallback,
+            instrumentedElicitationCallback,
+          );
+          const batchLatencyMs = Date.now() - batchStartedAt;
+
           for (const toolCall of toolCalls) {
-            const toolStartedAt = Date.now();
-            const result = await this.tools.execute(
-              toolCall.id,
-              toolCall.function.name,
-              toolCall.function.arguments,
-              this.approvalCallback,
-            );
-            const toolLatencyMs = Date.now() - toolStartedAt;
+            const result =
+              toolResults.get(toolCall.id) ??
+              jsonDumpsSafe({ error: "No result for tool_call_id" });
             this.debug.logToolResult(toolCall.id, true, result);
             let parsedResponse: unknown;
             try {
@@ -546,7 +576,7 @@ export class Agent {
                   request: toolCall,
                   response: parsedResponse,
                 },
-                latencyMs: toolLatencyMs,
+                latencyMs: batchLatencyMs,
               }),
             );
             this.memory.append({

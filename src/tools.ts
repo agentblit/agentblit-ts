@@ -1,6 +1,9 @@
 import {
   ApprovalCallback,
   AgentBlitAgentConfig,
+  ElicitationCallback,
+  ElicitationRequest,
+  ElicitationResult,
   OpenAIToolCall,
   ToolDefinition,
   ToolHandler,
@@ -137,89 +140,259 @@ export class ToolRegistry {
     return ["y", "yes"].includes(answer.toLowerCase());
   }
 
+  private parseToolArguments(
+    argumentsJson: string,
+  ): { ok: true; args: Record<string, unknown> } | { ok: false; error: string } {
+    try {
+      const args = argumentsJson
+        ? (JSON.parse(argumentsJson) as Record<string, unknown>)
+        : {};
+      return { ok: true, args };
+    } catch (error) {
+      return { ok: false, error: `Invalid JSON arguments: ${String(error)}` };
+    }
+  }
+
   async execute(
     toolCallId: string,
     toolName: string,
     argumentsJson: string,
     approvalCallback?: ApprovalCallback,
+    elicitationCallback?: ElicitationCallback,
   ): Promise<string> {
-    const definition = this.getDefinition(toolName);
-    if (!definition) {
-      return jsonDumpsSafe({ error: `Unknown tool: ${toolName}` });
-    }
-    let args: Record<string, unknown>;
-    try {
-      args = argumentsJson ? (JSON.parse(argumentsJson) as Record<string, unknown>) : {};
-    } catch (error) {
-      return jsonDumpsSafe({ error: `Invalid JSON arguments: ${String(error)}` });
+    const results = await this.executeBatch(
+      [{ id: toolCallId, function: { name: toolName, arguments: argumentsJson } }],
+      approvalCallback,
+      elicitationCallback,
+    );
+    return results.get(toolCallId) ?? jsonDumpsSafe({ error: "No result for tool_call_id" });
+  }
+
+  /**
+   * Executes multiple tool calls in one round.
+   * Custom tools (inline handlers) run sequentially; remote tools are sent in a
+   * single POST to `/api/1.0/tools/call` so the server can reuse one MCP session.
+   *
+   * When a remote tool responds with `elicitation_required`, the SDK calls
+   * `elicitationCallback` to collect user input, then retries the call with
+   * `elicitation_result`. This loop continues until the tool resolves or the
+   * user declines/cancels.
+   */
+  async executeBatch(
+    toolCalls: Array<{ id: string; function: { name: string; arguments: string } }>,
+    approvalCallback?: ApprovalCallback,
+    elicitationCallback?: ElicitationCallback,
+  ): Promise<Map<string, string>> {
+    const results = new Map<string, string>();
+    const remotePending: Array<{
+      toolCall: { id: string; function: { name: string; arguments: string } };
+      args: Record<string, unknown>;
+    }> = [];
+
+    for (const toolCall of toolCalls) {
+      const definition = this.getDefinition(toolCall.function.name);
+      if (!definition) {
+        results.set(
+          toolCall.id,
+          jsonDumpsSafe({ error: `Unknown tool: ${toolCall.function.name}` }),
+        );
+        continue;
+      }
+
+      const parsed = this.parseToolArguments(toolCall.function.arguments);
+      if (!parsed.ok) {
+        results.set(toolCall.id, jsonDumpsSafe({ error: parsed.error }));
+        continue;
+      }
+      const args = parsed.args;
+
+      if (definition.handler) {
+        const result = await this.executeCustomTool(
+          definition,
+          toolCall.function.name,
+          args,
+          approvalCallback,
+        );
+        results.set(toolCall.id, result);
+        continue;
+      }
+
+      if (!(await this.ensureApproval(definition, toolCall.function.name, args, approvalCallback))) {
+        results.set(
+          toolCall.id,
+          jsonDumpsSafe({ error: "User denied approval for this tool call." }),
+        );
+        continue;
+      }
+
+      remotePending.push({ toolCall, args });
     }
 
+    if (remotePending.length > 0) {
+      // Run elicitation-aware HTTP round-trips for each remote tool individually
+      // so we can interleave elicitation without blocking unrelated calls.
+      const remoteResults = await Promise.all(
+        remotePending.map(({ toolCall, args }) =>
+          this.executeRemoteToolWithElicitation(
+            toolCall,
+            args,
+            elicitationCallback,
+          ),
+        ),
+      );
+      for (const { id, result } of remoteResults) {
+        results.set(id, result);
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Executes one remote tool call, handling the `elicitation_required` retry loop.
+   * Each iteration posts to `/api/1.0/tools/call`; if the server returns
+   * `elicitation_required`, we call `elicitationCallback`, attach the result, and
+   * retry. The loop exits when the server returns a final result or error, or when
+   * the user declines/cancels.
+   */
+  private async executeRemoteToolWithElicitation(
+    toolCall: { id: string; function: { name: string; arguments: string } },
+    args: Record<string, unknown>,
+    elicitationCallback?: ElicitationCallback,
+  ): Promise<{ id: string; result: string }> {
+    const url = `${this.baseUrl}/api/1.0/tools/call`;
+    let pendingElicitationResult: ElicitationResult | undefined;
+
+    // Max elicitation rounds per call to prevent infinite loops.
+    const MAX_ELICITATION_ROUNDS = 10;
+
+    for (let round = 0; round <= MAX_ELICITATION_ROUNDS; round += 1) {
+      const payload: Record<string, unknown> = {
+        tool_calls: [
+          {
+            id: toolCall.id,
+            type: "function",
+            function: {
+              name: toolCall.function.name,
+              arguments: jsonDumpsSafe(args),
+            },
+          },
+        ] satisfies OpenAIToolCall[],
+      };
+
+      if (pendingElicitationResult) {
+        payload.elicitation_result = pendingElicitationResult;
+      }
+
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "X-API-Key": this.apiKey,
+            "Content-Type": "application/json",
+          },
+          body: jsonDumpsSafe(payload),
+          signal: AbortSignal.timeout(this.timeout),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { id: toolCall.id, result: jsonDumpsSafe({ error: message }) };
+      }
+
+      if (!response.ok) {
+        return {
+          id: toolCall.id,
+          result: jsonDumpsSafe({
+            error: `AgentBlit request failed for POST '${url}': ${response.status} ${response.statusText}`,
+          }),
+        };
+      }
+
+      const data = (await response.json()) as {
+        results?: Array<{
+          tool_call_id?: string;
+          result?: unknown;
+          error?: unknown;
+          elicitation_required?: ElicitationRequest;
+        }>;
+      };
+
+      const row = (data.results ?? []).find((r) => r.tool_call_id === toolCall.id);
+      if (!row) {
+        return {
+          id: toolCall.id,
+          result: jsonDumpsSafe({ error: "No result for tool_call_id" }),
+        };
+      }
+
+      // Server is requesting user input before it can complete the tool call.
+      if (row.elicitation_required) {
+        if (!elicitationCallback) {
+          // No callback — cancel immediately so the connector can handle it gracefully.
+          pendingElicitationResult = { action: "cancel" };
+          continue;
+        }
+
+        const elicitResult = await elicitationCallback(
+          toolCall.function.name,
+          row.elicitation_required,
+        );
+
+        if (elicitResult.action !== "accept") {
+          // User declined or cancelled — return the result of the final (non-elicitation) call.
+          pendingElicitationResult = elicitResult;
+          continue;
+        }
+
+        pendingElicitationResult = elicitResult;
+        continue;
+      }
+
+      // Final result or error.
+      if (typeof row.error !== "undefined") {
+        return { id: toolCall.id, result: jsonDumpsSafe({ error: row.error }) };
+      }
+      if (typeof row.result !== "undefined") {
+        return { id: toolCall.id, result: jsonDumpsSafe(row.result) };
+      }
+      return {
+        id: toolCall.id,
+        result: jsonDumpsSafe({ error: "Missing result or error for tool_call_id" }),
+      };
+    }
+
+    return {
+      id: toolCall.id,
+      result: jsonDumpsSafe({ error: "Exceeded max elicitation rounds" }),
+    };
+  }
+
+  private async executeCustomTool(
+    definition: ToolDefinition,
+    toolName: string,
+    args: Record<string, unknown>,
+    approvalCallback?: ApprovalCallback,
+  ): Promise<string> {
     if (!(await this.ensureApproval(definition, toolName, args, approvalCallback))) {
       console.error("User denied approval for this tool call.", toolName, args);
       return jsonDumpsSafe({ error: "User denied approval for this tool call." });
     }
 
-    if (definition.handler) {
-      try {
-        let result: unknown;
-        try {
-          result = await definition.handler(...Object.values(args));
-        } catch {
-          result = await definition.handler(args);
-        }
-        return jsonDumpsSafe(result);
-      } catch (error) {
-        return jsonDumpsSafe({ error: error instanceof Error ? error.message : String(error) });
-      }
+    if (!definition.handler) {
+      return jsonDumpsSafe({ error: `Tool has no handler: ${toolName}` });
     }
 
-    const payload = {
-      tool_calls: [
-        {
-          id: toolCallId,
-          type: "function",
-          function: {
-            name: toolName,
-            arguments: jsonDumpsSafe(args),
-          },
-        },
-      ] satisfies OpenAIToolCall[],
-    };
-    if (!toolCallId.trim()) {
-      return jsonDumpsSafe({ error: "Missing tool_call_id" });
+    try {
+      let result: unknown;
+      try {
+        result = await definition.handler(...Object.values(args));
+      } catch {
+        result = await definition.handler(args);
+      }
+      return jsonDumpsSafe(result);
+    } catch (error) {
+      return jsonDumpsSafe({ error: error instanceof Error ? error.message : String(error) });
     }
-    const url = `${this.baseUrl}/api/1.0/tools/call`;
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "X-API-Key": this.apiKey,
-        "Content-Type": "application/json",
-      },
-      body: jsonDumpsSafe(payload),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!response.ok) {
-      throw new Error(
-        `AgentBlit request failed for POST '${url}': ${response.status} ${response.statusText}`,
-      );
-    }
-    const data = (await response.json()) as {
-      results?: Array<{
-        tool_call_id?: string;
-        result?: unknown;
-        error?: unknown;
-      }>;
-    };
-    const result = (data.results ?? []).find((item) => item.tool_call_id === toolCallId);
-    if (!result) {
-      return jsonDumpsSafe({ error: "No result for tool_call_id" });
-    }
-    if (typeof result.error !== "undefined") {
-      return jsonDumpsSafe({ error: result.error });
-    }
-    if (typeof result.result !== "undefined") {
-      return jsonDumpsSafe(result.result);
-    }
-    return jsonDumpsSafe({ error: "Missing result or error for tool_call_id" });
   }
 }

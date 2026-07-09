@@ -39,6 +39,57 @@ export type ApprovalCallback = (
   args: Record<string, unknown>,
 ) => Promise<boolean>;
 
+/**
+ * A flat JSON Schema property as defined in the MCP elicitation spec
+ * (`requestedSchema.properties[key]`). Only top-level primitive fields are supported —
+ * no nesting. A `string` field with `enum` renders as a multiple-choice picker.
+ */
+export interface ElicitFieldSchema {
+  type: "string" | "number" | "integer" | "boolean";
+  title?: string;
+  description?: string;
+  /** When present on a `string` field, the host should render a choice picker. */
+  enum?: string[];
+  minimum?: number;
+  maximum?: number;
+  default?: string | number | boolean | string[];
+}
+
+/** Mirrors MCP `ElicitRequest.params` (form mode). */
+export interface ElicitationRequest {
+  /** Human-readable message describing what information is needed. */
+  message: string;
+  /**
+   * Optional JSON Schema subset for the fields to collect.
+   * When absent, the host should present a plain confirm/decline prompt.
+   */
+  requestedSchema?: {
+    type: "object";
+    properties: Record<string, ElicitFieldSchema>;
+    required?: string[];
+  };
+}
+
+/** Mirrors MCP `ElicitResult`. */
+export interface ElicitationResult {
+  /** "accept" — user filled the form; "decline" / "cancel" — user refused. */
+  action: "accept" | "decline" | "cancel";
+  /** Field values, keyed by property name. Present only when `action === "accept"`. */
+  content?: Record<string, string | number | boolean | string[]>;
+}
+
+/**
+ * Called by the SDK when a remote tool (MCP or HTTP connector) requests user
+ * input mid-execution. The host application must present the form/picker to
+ * the user and resolve with an `ElicitationResult`.
+ *
+ * Return `{ action: "cancel" }` if no UI is available.
+ */
+export type ElicitationCallback = (
+  toolName: string,
+  request: ElicitationRequest,
+) => Promise<ElicitationResult>;
+
 export type SummarizeFn = (messages: ChatMessage[]) => Promise<string>;
 
 export interface OpenAITextContentPart {
@@ -103,6 +154,13 @@ export interface AgentOptions {
   debug?: boolean;
   timeout?: number;
   approvalCallback?: ApprovalCallback;
+  /**
+   * Called when a remote tool requests user input during execution (MCP or HTTP
+   * connector elicitation). The host application should present the prompt to the
+   * user and return an `ElicitationResult`. When absent, elicitation requests are
+   * automatically cancelled so the connector can handle the absent-user case.
+   */
+  elicitationCallback?: ElicitationCallback;
   customTools?: ToolHandler[];
   maxToolRounds?: number;
 }
