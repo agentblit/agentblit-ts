@@ -150,6 +150,8 @@ export interface AgentOptions {
   agentblitUrl?: string;
   /** When set, overrides the model from `GET /api/1.0/agent`. */
   model?: string;
+  /** Optional session id used on `/api/1.0/tools/call` and analytics events. */
+  sessionId?: string;
   maxHistory?: number;
   debug?: boolean;
   timeout?: number;

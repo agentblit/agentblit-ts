@@ -30,13 +30,15 @@ export class ToolRegistry {
   private readonly baseUrl: string;
   private readonly apiKey: string;
   private readonly timeout: number;
+  private readonly sessionId: string;
   private readonly remote = new Map<string, ToolDefinition>();
   private readonly custom = new Map<string, ToolDefinition>();
 
-  constructor(options: { baseUrl: string; apiKey: string; timeout?: number }) {
+  constructor(options: { baseUrl: string; apiKey: string; timeout?: number; sessionId?: string }) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.apiKey = options.apiKey;
     this.timeout = options.timeout ?? 30000;
+    this.sessionId = options.sessionId?.trim() || "";
   }
 
   register(fn: ToolHandler): void {
@@ -279,6 +281,10 @@ export class ToolRegistry {
           },
         ] satisfies OpenAIToolCall[],
       };
+
+      if (this.sessionId) {
+        payload.session_id = this.sessionId;
+      }
 
       if (pendingElicitationResult) {
         payload.elicitation_result = pendingElicitationResult;

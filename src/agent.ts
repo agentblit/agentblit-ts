@@ -214,7 +214,7 @@ export class Agent {
     this.approvalCallback = options.approvalCallback;
     this.elicitationCallback = options.elicitationCallback;
     this.maxToolRounds = maxToolRounds;
-    this.sessionId = randomUUID();
+    this.sessionId = options.sessionId?.trim() || randomUUID();
     this.eventBaseUrl = agentblitUrl;
     this.eventApiKey = agentblitApiKey;
     this.debug = new DebugLogger(this.debugEnabled);
@@ -223,6 +223,7 @@ export class Agent {
       baseUrl: agentblitUrl,
       apiKey: agentblitApiKey,
       timeout: timeoutMs,
+      sessionId: this.sessionId,
     });
     for (const customTool of options.customTools ?? []) {
       this.registerTool(customTool);
