@@ -26,6 +26,9 @@ const VENDOR_BASE_URLS: Record<string, string> = {
 const DEFAULT_TOOL_USAGE_INSTRUCTION =
   "Use tools when they help answer accurately.";
 
+/** Matches POST /api/events/batch `MAX_BATCH` on the AgentBlit API. */
+const MAX_EVENTS_PER_BATCH = 100;
+
 function resolveVendorAndModel(modelInput: string): { vendor: string; model: string } {
   const model = modelInput.trim();
   if (!model || !model.includes("/")) {
@@ -308,29 +311,36 @@ export class Agent {
       return;
     }
     const url = `${this.eventBaseUrl}/api/events/batch`;
-    this.debug.log("Event batch send start url=%s count=%s", url, events.length);
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "X-API-Key": this.eventApiKey,
-          "Content-Type": "application/json",
-        },
-        body: jsonDumpsSafe({ events }),
-        signal: AbortSignal.timeout(this.timeout),
-      });
-      if (!response.ok) {
-        const body = (await response.text()).slice(0, 1000);
+    for (let offset = 0; offset < events.length; offset += MAX_EVENTS_PER_BATCH) {
+      const chunk = events.slice(offset, offset + MAX_EVENTS_PER_BATCH);
+      this.debug.log("Event batch send start url=%s count=%s", url, chunk.length);
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "X-API-Key": this.eventApiKey,
+            "Content-Type": "application/json",
+          },
+          body: jsonDumpsSafe({ events: chunk }),
+          signal: AbortSignal.timeout(this.timeout),
+        });
+        if (!response.ok) {
+          const body = (await response.text()).slice(0, 1000);
+          this.debug.log(
+            "Failed to send events batch status=%s body=%s",
+            response.status,
+            body,
+          );
+          continue;
+        }
         this.debug.log(
-          "Failed to send events batch status=%s body=%s",
+          "Event batch send success status=%s count=%s",
           response.status,
-          body,
+          chunk.length,
         );
-        return;
+      } catch (error) {
+        this.debug.log("Failed to send events batch: %s", String(error));
       }
-      this.debug.log("Event batch send success status=%s count=%s", response.status, events.length);
-    } catch (error) {
-      this.debug.log("Failed to send events batch: %s", String(error));
     }
   }
 
