@@ -195,7 +195,7 @@ export class Agent {
     if (!agentblitApiKey) {
       throw new Error("agentblitApiKey is required");
     }
-    const maxHistory = options.maxHistory ?? 5;
+    const maxHistory = options.maxHistory ?? 10;
     if (maxHistory < 1) {
       throw new Error("maxHistory must be at least 1");
     }
@@ -465,10 +465,14 @@ export class Agent {
         >();
         let finishReason: string | null = null;
         let llmTotalTokens = 0;
+        let llmUsage: Record<string, unknown> | null = null;
 
         for await (const chunk of stream) {
-          if (chunk.usage?.total_tokens) {
-            llmTotalTokens = chunk.usage.total_tokens;
+          if (chunk.usage) {
+            llmUsage = chunk.usage as Record<string, unknown>;
+            if (typeof chunk.usage.total_tokens === "number") {
+              llmTotalTokens = chunk.usage.total_tokens;
+            }
           }
           const choice = chunk.choices?.[0];
           if (!choice) {
@@ -523,6 +527,7 @@ export class Agent {
                 finish_reason: finishReason,
                 content: assistantContent,
                 tool_calls: toolCalls,
+                ...(llmUsage ? { usage: llmUsage } : {}),
               },
             },
             tokens: llmTotalTokens,

@@ -6,7 +6,7 @@ export class ChatMemory {
   private readonly summarizeFn?: SummarizeFn;
 
   constructor(options?: { maxHistory?: number; summarizeFn?: SummarizeFn }) {
-    const maxHistory = options?.maxHistory ?? 5;
+    const maxHistory = options?.maxHistory ?? 10;
     if (maxHistory < 1) {
       throw new Error("maxHistory must be at least 1");
     }

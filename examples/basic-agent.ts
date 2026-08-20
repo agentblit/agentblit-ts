@@ -52,7 +52,7 @@ async function main(): Promise<void> {
   const agent = new Agent({
     apiKey,
     agentblitApiKey,
-    maxHistory: 5,
+    maxHistory: 10,
     debug: process.env.DEBUG === "1" || process.env.DEBUG === "true",
     timeout: Number(process.env.TIMEOUT_SECONDS ?? "30") || 30,
     customTools: [add],

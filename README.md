@@ -76,7 +76,7 @@ for await (const chunk of agent.run(input)) {
 | `apiKey` | `string` | Yes | - | LLM provider API key | Send model requests |
 | `agentblitApiKey` | `string` | Yes | - | AgentBlit API key (`X-API-Key`) | Load agent config + remote tools + analytics events |
 | `agentblitUrl` | `string` | No | `https://console.agentblit.com` | Valid base URL | Self-hosted or staging AgentBlit |
-| `maxHistory` | `number` | No | `5` | Integer `>= 1` | Keep recent messages before summarization |
+| `maxHistory` | `number` | No | `10` | Integer `>= 1` | Keep recent messages before summarization |
 | `maxToolRounds` | `number` | No | `25` | Integer `>= 1` | Limit LLM-tool loop iterations |
 | `debug` | `boolean` | No | `false` | `true` or `false` | Enable verbose SDK logs |
 | `timeout` | `number` (seconds) | No | `30` | Positive number | Control HTTP timeout for LLM + AgentBlit |
