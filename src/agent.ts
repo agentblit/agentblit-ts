@@ -181,6 +181,8 @@ export class Agent {
   private readonly eventBaseUrl: string;
   private readonly eventApiKey: string;
   private readonly pendingCustomEvents: EventPayload[] = [];
+  /** Events for the in-flight `run()`; summarization appends here when set. */
+  private activeRunEvents: EventPayload[] | null = null;
   private agentInitSent = false;
   private toolsSignature?: string;
   private initialized = false;
@@ -389,6 +391,7 @@ export class Agent {
   private async summarizeOlderMessages(older: ChatMessage[]): Promise<string> {
     const text = formatMessagesForSummary(older);
     this.debug.log("Summarizing %s older messages", older.length);
+    const startedAt = Date.now();
     const response = await this.client.chat.completions.create({
       model: this.model,
       messages: [
@@ -401,12 +404,32 @@ export class Agent {
       ],
       temperature: 0.2,
     });
-    return response.choices[0]?.message?.content?.trim() ?? "";
+    const usage = response.usage as Record<string, unknown> | undefined;
+    const totalTokens =
+      typeof usage?.total_tokens === "number" ? usage.total_tokens : 0;
+    const content = response.choices[0]?.message?.content?.trim() ?? "";
+    this.activeRunEvents?.push(
+      this.makeEvent({
+        eventType: "llm_call",
+        data: {
+          source: "memory_summarize",
+          request: { model: this.model, stream: false },
+          response: {
+            content,
+            ...(usage ? { usage } : {}),
+          },
+        },
+        tokens: totalTokens,
+        latencyMs: Date.now() - startedAt,
+      }),
+    );
+    return content;
   }
 
   async *run(userInput: AgentRunInput): AsyncGenerator<string> {
     const events: EventPayload[] = [...this.pendingCustomEvents];
     this.pendingCustomEvents.length = 0;
+    this.activeRunEvents = events;
     try {
       const userContent = normalizeRunInput(userInput);
       this.memory.append({ role: "user", content: userContent });
@@ -627,7 +650,11 @@ export class Agent {
       throw error;
     } finally {
       this.debug.log("Queueing event flush count=%s", events.length);
-      await this.flushEvents(events);
+      try {
+        await this.flushEvents(events);
+      } finally {
+        this.activeRunEvents = null;
+      }
     }
   }
 
