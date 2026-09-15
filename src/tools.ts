@@ -84,7 +84,10 @@ export class ToolRegistry {
   }
 
   async refreshRemote(): Promise<AgentBlitAgentConfig> {
-    const url = `${this.baseUrl}/api/1.0/agent`;
+    const url = new URL(`${this.baseUrl}/api/1.0/agent`);
+    if (this.sessionId) {
+      url.searchParams.set("session_id", this.sessionId);
+    }
     const response = await fetch(url, {
       method: "GET",
       headers: { "X-API-Key": this.apiKey },
