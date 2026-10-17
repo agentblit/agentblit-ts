@@ -14,7 +14,15 @@ import {
   ToolHandler,
 } from "./types.js";
 import { ToolRegistry } from "./tools.js";
-import { DebugLogger, jsonDumpsSafe, nowIsoTimestamp, randomId } from "./utils.js";
+import {
+  DebugLogger,
+  jsonDumpsSafe,
+  nowIsoTimestamp,
+  parseToolResultMedia,
+  randomId,
+  redactChatMessageForLog,
+  redactToolResultForLog,
+} from "./utils.js";
 
 const VENDOR_BASE_URLS: Record<string, string> = {
   openai: "https://api.openai.com/v1",
@@ -81,7 +89,7 @@ function serializeContentForSummary(content: ChatMessageContent | undefined): st
       continue;
     }
     if (part.type === "image_url") {
-      parts.push(`[image: ${part.image_url.url}]`);
+      parts.push("[image]");
       continue;
     }
     if (part.type === "file") {
@@ -360,13 +368,12 @@ export class Agent {
     if (!lastMessage) {
       return [];
     }
-    if (!summaryMessage) {
-      return [lastMessage];
-    }
-    if (summaryMessage === lastMessage) {
-      return [summaryMessage];
-    }
-    return [summaryMessage, lastMessage];
+    const picked = !summaryMessage
+      ? [lastMessage]
+      : summaryMessage === lastMessage
+        ? [summaryMessage]
+        : [summaryMessage, lastMessage];
+    return picked.map(redactChatMessageForLog);
   }
 
   private async buildAgentLoopErrorData(error: unknown): Promise<Record<string, unknown>> {
@@ -597,6 +604,7 @@ export class Agent {
           );
           const batchLatencyMs = Date.now() - batchStartedAt;
 
+          const imageFollowUps: OpenAIInputContentPart[][] = [];
           for (const toolCall of toolCalls) {
             const result =
               toolResults.get(toolCall.id) ??
@@ -613,15 +621,28 @@ export class Agent {
                 eventType: "tool_call",
                 data: {
                   request: toolCall,
-                  response: parsedResponse,
+                  response: redactToolResultForLog(parsedResponse),
                 },
                 latencyMs: batchLatencyMs,
               }),
             );
+            const media = parseToolResultMedia(result);
             this.memory.append({
               role: "tool",
               tool_call_id: toolCall.id,
-              content: result,
+              content: media.toolContent,
+            });
+            if (media.imageMessage) {
+              imageFollowUps.push(media.imageMessage);
+            }
+          }
+          // After all tool messages (OpenAI requires contiguous tool results).
+          // Keep only the latest screenshot to limit vision token cost.
+          if (imageFollowUps.length > 0) {
+            this.memory.dropScreenshotFollowUps();
+            this.memory.append({
+              role: "user",
+              content: imageFollowUps[imageFollowUps.length - 1]!,
             });
           }
           continue;

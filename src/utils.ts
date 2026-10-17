@@ -1,6 +1,11 @@
 import process from "node:process";
 import { randomUUID } from "node:crypto";
-import { ToolHandler, ToolOptions } from "./types.js";
+import type {
+  ChatMessage,
+  OpenAIInputContentPart,
+  ToolHandler,
+  ToolOptions,
+} from "./types.js";
 
 const LOGGER_PREFIX = "[agentblit]";
 
@@ -38,6 +43,107 @@ export function jsonDumpsSafe(obj: unknown): string {
     }
     return value;
   });
+}
+
+/** Strip large base64 image payloads from tool results before logging/events. */
+export function redactToolResultForLog(value: unknown): unknown {
+  if (!value || typeof value !== "object") return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => redactToolResultForLog(item));
+  }
+  const record = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(record)) {
+    if (
+      (key === "data" || key === "image_base64") &&
+      typeof item === "string" &&
+      item.length > 200
+    ) {
+      out[key] = `[base64 ${item.length} chars]`;
+      continue;
+    }
+    out[key] = redactToolResultForLog(item);
+  }
+  return out;
+}
+
+/** Redact data-URL images in chat messages before logging/events. */
+export function redactChatMessageForLog(message: ChatMessage): ChatMessage {
+  const content = message.content;
+  if (!Array.isArray(content)) return message;
+  return {
+    ...message,
+    content: content.map((part) => {
+      if (part.type !== "image_url") return part;
+      const url = part.image_url.url;
+      if (!url.startsWith("data:") || url.length < 200) return part;
+      return {
+        type: "image_url" as const,
+        image_url: {
+          ...part.image_url,
+          url: `[data-url ${url.length} chars]`,
+        },
+      };
+    }),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+export type ParsedToolResultMedia = {
+  /** String content for the `tool` role (Chat Completions requires string). */
+  toolContent: string;
+  /** Follow-up user message with images (vision). Null if none. */
+  imageMessage: OpenAIInputContentPart[] | null;
+};
+
+/**
+ * Split a tools/call JSON result into a string tool message plus optional
+ * vision follow-up. Chat Completions tool roles are string-only; screenshots
+ * are attached as the next user message so the model can see them.
+ */
+export function parseToolResultMedia(resultJson: string): ParsedToolResultMedia {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(resultJson) as unknown;
+  } catch {
+    return { toolContent: resultJson, imageMessage: null };
+  }
+  if (!isRecord(parsed) || !Array.isArray(parsed.content)) {
+    return { toolContent: resultJson, imageMessage: null };
+  }
+
+  const textParts: string[] = [];
+  const imageParts: OpenAIInputContentPart[] = [];
+  for (const block of parsed.content) {
+    if (!isRecord(block) || typeof block.type !== "string") continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      textParts.push(block.text);
+      continue;
+    }
+    if (block.type === "image" && typeof block.data === "string" && block.data) {
+      const mime =
+        typeof block.mimeType === "string" && block.mimeType
+          ? block.mimeType
+          : "image/jpeg";
+      imageParts.push({
+        type: "image_url",
+        image_url: { url: `data:${mime};base64,${block.data}`, detail: "high" },
+      });
+    }
+  }
+
+  if (imageParts.length === 0) {
+    return { toolContent: resultJson, imageMessage: null };
+  }
+
+  const summary = textParts.join("\n").trim() || "Screenshot attached.";
+  return {
+    toolContent: jsonDumpsSafe({ ok: true, text: summary, image: true }),
+    imageMessage: [{ type: "text", text: summary }, ...imageParts],
+  };
 }
 
 function extractParamNames(fn: ToolHandler): string[] {

@@ -30,6 +30,27 @@ export class ChatMemory {
     this.messagesStore.length = 0;
   }
 
+  /** Drop prior computer-screenshot follow-ups (not user-uploaded images). */
+  dropScreenshotFollowUps(): void {
+    for (let i = this.messagesStore.length - 1; i >= 0; i -= 1) {
+      const message = this.messagesStore[i];
+      if (!message || message.role !== "user" || !Array.isArray(message.content)) {
+        continue;
+      }
+      const text = message.content.find((part) => part.type === "text");
+      const hasImage = message.content.some((part) => part.type === "image_url");
+      if (
+        !hasImage ||
+        !text ||
+        text.type !== "text" ||
+        !/Screenshot \d+x\d+/.test(text.text)
+      ) {
+        continue;
+      }
+      this.messagesStore.splice(i, 1);
+    }
+  }
+
   async buildMessagesForLLM(systemPrompt: string): Promise<ChatMessage[]> {
     const out: ChatMessage[] = [{ role: "system", content: systemPrompt }];
     if (this.messagesStore.length <= this.maxHistory) {
