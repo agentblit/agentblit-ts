@@ -1,6 +1,8 @@
 import {
   ApprovalCallback,
   AgentBlitAgentConfig,
+  AgentInterrupt,
+  AgentInterruptedError,
   ElicitationCallback,
   ElicitationRequest,
   ElicitationResult,
@@ -132,12 +134,17 @@ export class ToolRegistry {
     toolName: string,
     args: Record<string, unknown>,
     approvalCallback?: ApprovalCallback,
+    toolCallId?: string,
   ): Promise<boolean> {
     if (definition.permissionMode !== "needs_approval") {
       return true;
     }
     if (approvalCallback) {
-      return approvalCallback(toolName, args);
+      return approvalCallback(
+        toolName,
+        args,
+        toolCallId ? { toolCallId } : undefined,
+      );
     }
     const answer = await readStdinLine(
       `Approve tool "${toolName}" with args ${jsonDumpsSafe(args)}? [y/N]: `,
@@ -217,12 +224,21 @@ export class ToolRegistry {
           toolCall.function.name,
           args,
           approvalCallback,
+          toolCall.id,
         );
         results.set(toolCall.id, result);
         continue;
       }
 
-      if (!(await this.ensureApproval(definition, toolCall.function.name, args, approvalCallback))) {
+      if (
+        !(await this.ensureApproval(
+          definition,
+          toolCall.function.name,
+          args,
+          approvalCallback,
+          toolCall.id,
+        ))
+      ) {
         results.set(
           toolCall.id,
           jsonDumpsSafe({ error: "User denied approval for this tool call." }),
@@ -234,9 +250,9 @@ export class ToolRegistry {
     }
 
     if (remotePending.length > 0) {
-      // Run elicitation-aware HTTP round-trips for each remote tool individually
-      // so we can interleave elicitation without blocking unrelated calls.
-      const remoteResults = await Promise.all(
+      // Wait for every call in the batch. An elicitation interrupt must not drop
+      // results from siblings that already finished — resume would run them again.
+      const settled = await Promise.allSettled(
         remotePending.map(({ toolCall, args }) =>
           this.executeRemoteToolWithElicitation(
             toolCall,
@@ -245,8 +261,28 @@ export class ToolRegistry {
           ),
         ),
       );
-      for (const { id, result } of remoteResults) {
-        results.set(id, result);
+
+      const interrupts: AgentInterrupt[] = [];
+      let otherError: unknown;
+      for (const outcome of settled) {
+        if (outcome.status === "fulfilled") {
+          results.set(outcome.value.id, outcome.value.result);
+          continue;
+        }
+        if (outcome.reason instanceof AgentInterruptedError) {
+          interrupts.push(...outcome.reason.interrupts);
+          continue;
+        }
+        otherError = outcome.reason;
+      }
+
+      if (interrupts.length > 0) {
+        const error = new AgentInterruptedError(interrupts);
+        error.completedToolResults = results;
+        throw error;
+      }
+      if (otherError) {
+        throw otherError;
       }
     }
 
@@ -346,6 +382,7 @@ export class ToolRegistry {
         const elicitResult = await elicitationCallback(
           toolCall.function.name,
           row.elicitation_required,
+          { toolCallId: toolCall.id, args },
         );
 
         if (elicitResult.action !== "accept") {
@@ -377,13 +414,48 @@ export class ToolRegistry {
     };
   }
 
+  /**
+   * Tools in this batch that require human approval before execution.
+   * Used when `interruptOnUserInput` is enabled so the host can end the run.
+   */
+  collectApprovalInterrupts(
+    toolCalls: Array<{ id: string; function: { name: string; arguments: string } }>,
+  ): AgentInterrupt[] {
+    const interrupts: AgentInterrupt[] = [];
+    for (const toolCall of toolCalls) {
+      const definition = this.getDefinition(toolCall.function.name);
+      if (!definition || definition.permissionMode !== "needs_approval") {
+        continue;
+      }
+      const parsed = this.parseToolArguments(toolCall.function.arguments);
+      const args = parsed.ok ? parsed.args : {};
+      interrupts.push({
+        id: toolCall.id,
+        kind: "approval",
+        toolCallId: toolCall.id,
+        toolName: toolCall.function.name,
+        args,
+      });
+    }
+    return interrupts;
+  }
+
   private async executeCustomTool(
     definition: ToolDefinition,
     toolName: string,
     args: Record<string, unknown>,
     approvalCallback?: ApprovalCallback,
+    toolCallId?: string,
   ): Promise<string> {
-    if (!(await this.ensureApproval(definition, toolName, args, approvalCallback))) {
+    if (
+      !(await this.ensureApproval(
+        definition,
+        toolName,
+        args,
+        approvalCallback,
+        toolCallId,
+      ))
+    ) {
       console.error("User denied approval for this tool call.", toolName, args);
       return jsonDumpsSafe({ error: "User denied approval for this tool call." });
     }

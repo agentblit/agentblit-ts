@@ -2,6 +2,8 @@ import OpenAI from "openai";
 import { randomUUID } from "node:crypto";
 import { ChatMemory } from "./memory.js";
 import {
+  AgentInterruptedError,
+  AgentInterruptDecision,
   AgentRunInput,
   AgentConfig,
   AgentOptions,
@@ -185,6 +187,8 @@ export class Agent {
   private readonly debug: DebugLogger;
   private readonly approvalCallback?: AgentOptions["approvalCallback"];
   private readonly elicitationCallback?: AgentOptions["elicitationCallback"];
+  private readonly interruptOnUserInput: boolean;
+  private readonly onToolActivity?: AgentOptions["onToolActivity"];
   private readonly maxToolRounds: number;
   private readonly eventBaseUrl: string;
   private readonly eventApiKey: string;
@@ -226,6 +230,8 @@ export class Agent {
     this.timeout = timeoutMs;
     this.approvalCallback = options.approvalCallback;
     this.elicitationCallback = options.elicitationCallback;
+    this.interruptOnUserInput = Boolean(options.interruptOnUserInput);
+    this.onToolActivity = options.onToolActivity;
     this.maxToolRounds = maxToolRounds;
     this.sessionId = options.sessionId?.trim() || randomUUID();
     this.eventBaseUrl = agentblitUrl;
@@ -463,205 +469,11 @@ export class Agent {
         }),
       );
 
-      let finishedNormally = false;
-      for (let round = 0; round < this.maxToolRounds; round += 1) {
-        const messages = await this.memory.buildMessagesForLLM(this.systemPrompt);
-        this.debug.logLLMRequest(this.model, messages.length, openaiTools.length);
-        const llmRequest = {
-          model: this.model,
-          messages: messages as any,
-          stream: true as const,
-          ...(openaiTools.length > 0 ? { tools: openaiTools } : {}),
-          ...(this.vendor === "openai" || this.vendor === "openrouter"
-            ? { stream_options: { include_usage: true } }
-            : {}),
-        };
-
-        const llmEventRequestData = {
-          model: this.model,
-          messages: this.extractLlmEventMessages(messages) as any,
-          stream: true,
-        };
-
-        const startedAt = Date.now();
-        const stream = (await this.client.chat.completions.create(
-          llmRequest as any,
-        )) as unknown as AsyncIterable<any>;
-
-        const contentParts: string[] = [];
-        const toolCallsMap = new Map<
-          number,
-          { id: string; name: string; arguments: string }
-        >();
-        let finishReason: string | null = null;
-        let llmTotalTokens = 0;
-        let llmUsage: Record<string, unknown> | null = null;
-
-        for await (const chunk of stream) {
-          if (chunk.usage) {
-            llmUsage = chunk.usage as Record<string, unknown>;
-            if (typeof chunk.usage.total_tokens === "number") {
-              llmTotalTokens = chunk.usage.total_tokens;
-            }
-          }
-          const choice = chunk.choices?.[0];
-          if (!choice) {
-            continue;
-          }
-          if (choice.finish_reason) {
-            finishReason = choice.finish_reason;
-          }
-          const delta = choice.delta;
-          if (!delta) {
-            continue;
-          }
-          if (delta.content) {
-            contentParts.push(delta.content);
-            yield delta.content;
-          }
-          for (const toolCall of delta.tool_calls ?? []) {
-            const index = toolCall.index ?? 0;
-            const existing = toolCallsMap.get(index) ?? { id: "", name: "", arguments: "" };
-            if (toolCall.id) {
-              existing.id = toolCall.id;
-            }
-            if (toolCall.function?.name) {
-              existing.name = toolCall.function.name;
-            }
-            if (toolCall.function?.arguments) {
-              existing.arguments += toolCall.function.arguments;
-            }
-            toolCallsMap.set(index, existing);
-          }
-        }
-
-        const assistantContent = contentParts.join("") || null;
-        const llmLatencyMs = Date.now() - startedAt;
-        const toolCalls = [...toolCallsMap.entries()]
-          .sort(([a], [b]) => a - b)
-          .map(([, call]): OpenAIToolCall => ({
-            id: call.id,
-            type: "function",
-            function: {
-              name: call.name,
-              arguments: call.arguments || "{}",
-            },
-          }));
-
-        events.push(
-          this.makeEvent({
-            eventType: "llm_call",
-            data: {
-              request: llmEventRequestData,
-              response: {
-                finish_reason: finishReason,
-                content: assistantContent,
-                tool_calls: toolCalls,
-                ...(llmUsage ? { usage: llmUsage } : {}),
-              },
-            },
-            tokens: llmTotalTokens,
-            latencyMs: llmLatencyMs,
-          }),
-        );
-
-        if (finishReason === "tool_calls" || toolCalls.length > 0) {
-          this.debug.logToolCalls(toolCalls);
-          this.memory.append({
-            role: "assistant",
-            content: assistantContent,
-            tool_calls: toolCalls,
-          });
-
-          // Wrap elicitationCallback to emit elicitation_request / elicitation_response
-          // events so analytics can separate user think-time from tool execution time.
-          const instrumentedElicitationCallback = this.elicitationCallback
-            ? async (toolName: string, request: ElicitationRequest): Promise<ElicitationResult> => {
-                const elicitStartedAt = Date.now();
-                events.push(
-                  this.makeEvent({
-                    eventType: "elicitation_request",
-                    data: { tool_name: toolName, request },
-                  }),
-                );
-                const result = await this.elicitationCallback!(toolName, request);
-                events.push(
-                  this.makeEvent({
-                    eventType: "elicitation_response",
-                    data: { tool_name: toolName, result },
-                    latencyMs: Date.now() - elicitStartedAt,
-                  }),
-                );
-                return result;
-              }
-            : undefined;
-
-          const batchStartedAt = Date.now();
-          const toolResults = await this.tools.executeBatch(
-            toolCalls,
-            this.approvalCallback,
-            instrumentedElicitationCallback,
-          );
-          const batchLatencyMs = Date.now() - batchStartedAt;
-
-          const imageFollowUps: OpenAIInputContentPart[][] = [];
-          for (const toolCall of toolCalls) {
-            const result =
-              toolResults.get(toolCall.id) ??
-              jsonDumpsSafe({ error: "No result for tool_call_id" });
-            this.debug.logToolResult(toolCall.id, true, result);
-            let parsedResponse: unknown;
-            try {
-              parsedResponse = JSON.parse(result);
-            } catch {
-              parsedResponse = { raw: result };
-            }
-            events.push(
-              this.makeEvent({
-                eventType: "tool_call",
-                data: {
-                  request: toolCall,
-                  response: redactToolResultForLog(parsedResponse),
-                },
-                latencyMs: batchLatencyMs,
-              }),
-            );
-            const media = parseToolResultMedia(result);
-            this.memory.append({
-              role: "tool",
-              tool_call_id: toolCall.id,
-              content: media.toolContent,
-            });
-            if (media.imageMessage) {
-              imageFollowUps.push(media.imageMessage);
-            }
-          }
-          // After all tool messages (OpenAI requires contiguous tool results).
-          // Keep only the latest screenshot to limit vision token cost.
-          if (imageFollowUps.length > 0) {
-            this.memory.dropScreenshotFollowUps();
-            this.memory.append({
-              role: "user",
-              content: imageFollowUps[imageFollowUps.length - 1]!,
-            });
-          }
-          continue;
-        }
-
-        this.memory.append({
-          role: "assistant",
-          content: assistantContent ?? "",
-        });
-        finishedNormally = true;
-        break;
-      }
-
-      if (!finishedNormally) {
-        throw new Error(
-          `Exceeded maxToolRounds (${this.maxToolRounds}); increase maxToolRounds or simplify the task.`,
-        );
-      }
+      yield* this.runLoop(events);
     } catch (error) {
+      if (error instanceof AgentInterruptedError) {
+        throw error;
+      }
       events.push(
         this.makeEvent({
           eventType: "agent_loop_error",
@@ -670,12 +482,506 @@ export class Agent {
       );
       throw error;
     } finally {
-      this.debug.log("Queueing event flush count=%s", events.length);
-      try {
-        await this.flushEvents(events);
-      } finally {
-        this.activeRunEvents = null;
+      if (this.activeRunEvents === events) {
+        this.debug.log("Queueing event flush count=%s", events.length);
+        try {
+          await this.flushEvents(events);
+        } finally {
+          this.activeRunEvents = null;
+        }
       }
+    }
+  }
+
+  /**
+   * Continues a run that stopped with {@link AgentInterruptedError}.
+   * Memory must still contain the assistant message with pending `tool_calls`.
+   */
+  async *resume(decisions: AgentInterruptDecision[]): AsyncGenerator<string> {
+    const events: EventPayload[] = [...this.pendingCustomEvents];
+    this.pendingCustomEvents.length = 0;
+    this.activeRunEvents = events;
+    try {
+      await this.ensureInitialized();
+      const pending = this.findPendingToolCalls();
+      if (pending.length === 0) {
+        throw new Error(
+          "resume() requires an assistant message with pending tool_calls in memory",
+        );
+      }
+
+      const decisionById = new Map(
+        decisions.map((decision) => [decision.toolCallId, decision]),
+      );
+      const approvalCallback = async (
+        toolName: string,
+        args: Record<string, unknown>,
+        meta?: { toolCallId: string },
+      ): Promise<boolean> => {
+        const toolCallId = meta?.toolCallId;
+        if (!toolCallId) return false;
+        const decision = decisionById.get(toolCallId);
+        if (!decision || decision.kind !== "approval") {
+          throw new Error(
+            `Missing approval decision for tool call ${toolCallId} (${toolName})`,
+          );
+        }
+        void args;
+        return decision.approved;
+      };
+
+      const elicitationCallback = async (
+        toolName: string,
+        request: ElicitationRequest,
+        meta?: { toolCallId: string; args: Record<string, unknown> },
+      ): Promise<ElicitationResult> => {
+        const toolCallId = meta?.toolCallId;
+        if (!toolCallId) return { action: "cancel" };
+        const decision = decisionById.get(toolCallId);
+        if (decision?.kind === "elicitation") {
+          return decision.result;
+        }
+        if (this.interruptOnUserInput) {
+          throw new AgentInterruptedError([
+            {
+              id: toolCallId,
+              kind: "elicitation",
+              toolCallId,
+              toolName,
+              args: meta?.args ?? {},
+              elicitation: request,
+            },
+          ]);
+        }
+        if (this.elicitationCallback) {
+          return this.elicitationCallback(toolName, request, meta);
+        }
+        return { action: "cancel" };
+      };
+
+      await this.executeToolRound(pending, events, {
+        approvalCallback,
+        elicitationCallback,
+      });
+
+      yield* this.runLoop(events);
+    } catch (error) {
+      if (error instanceof AgentInterruptedError) {
+        throw error;
+      }
+      events.push(
+        this.makeEvent({
+          eventType: "agent_loop_error",
+          data: await this.buildAgentLoopErrorData(error),
+        }),
+      );
+      throw error;
+    } finally {
+      if (this.activeRunEvents === events) {
+        this.debug.log("Queueing event flush count=%s", events.length);
+        try {
+          await this.flushEvents(events);
+        } finally {
+          this.activeRunEvents = null;
+        }
+      }
+    }
+  }
+
+  /**
+   * Tool calls on the latest assistant message that do not yet have a tool result.
+   * Earlier tool results in the same turn are ignored so a partial elicitation
+   * batch can resume only the calls that are still open.
+   */
+  getPendingToolCalls(): OpenAIToolCall[] {
+    return this.findPendingToolCalls();
+  }
+
+  /**
+   * Insert a tool result for every assistant `tool_calls` entry that never
+   * received one, including calls left open when the user sends a new message.
+   * Returns the calls that were closed.
+   */
+  closeDanglingToolCalls(
+    reason = "The user moved on before this tool call was resolved.",
+  ): OpenAIToolCall[] {
+    const closed: OpenAIToolCall[] = [];
+    const next: ChatMessage[] = [];
+    const messages = this.memory.messages;
+
+    for (let i = 0; i < messages.length; i += 1) {
+      const message = messages[i];
+      if (!message) continue;
+      next.push(message);
+      if (message.role !== "assistant" || !message.tool_calls?.length) continue;
+
+      const missing = new Set(message.tool_calls.map((call) => call.id));
+      let j = i + 1;
+      while (j < messages.length && messages[j]?.role === "tool") {
+        const toolCallId = messages[j]?.tool_call_id;
+        if (toolCallId) missing.delete(toolCallId);
+        j += 1;
+      }
+      if (missing.size === 0) continue;
+
+      for (const call of message.tool_calls) {
+        if (!missing.has(call.id)) continue;
+        next.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: jsonDumpsSafe({ error: reason }),
+        });
+        closed.push(call);
+      }
+    }
+
+    if (closed.length > 0) {
+      this.memory.replace(next);
+    }
+    return closed;
+  }
+
+  private findPendingToolCalls(): OpenAIToolCall[] {
+    const messages = this.memory.messages;
+    const satisfied = new Set<string>();
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i];
+      if (!message) continue;
+      if (message.role === "tool") {
+        if (message.tool_call_id) satisfied.add(message.tool_call_id);
+        continue;
+      }
+      if (message.role === "assistant" && message.tool_calls?.length) {
+        return message.tool_calls.filter((call) => !satisfied.has(call.id));
+      }
+      if (message.role === "user" || message.role === "assistant") {
+        return [];
+      }
+    }
+    return [];
+  }
+
+  private makeElicitationCallback(
+    events: EventPayload[],
+  ):
+    | ((
+        toolName: string,
+        request: ElicitationRequest,
+        meta?: { toolCallId: string; args: Record<string, unknown> },
+      ) => Promise<ElicitationResult>)
+    | undefined {
+    if (this.interruptOnUserInput) {
+      return async (toolName, request, meta) => {
+        const toolCallId = meta?.toolCallId ?? randomUUID();
+        events.push(
+          this.makeEvent({
+            eventType: "elicitation_request",
+            data: { tool_name: toolName, request },
+          }),
+        );
+        throw new AgentInterruptedError([
+          {
+            id: toolCallId,
+            kind: "elicitation",
+            toolCallId,
+            toolName,
+            args: meta?.args ?? {},
+            elicitation: request,
+          },
+        ]);
+      };
+    }
+    if (!this.elicitationCallback) return undefined;
+    return async (toolName, request, meta) => {
+      const elicitStartedAt = Date.now();
+      events.push(
+        this.makeEvent({
+          eventType: "elicitation_request",
+          data: { tool_name: toolName, request },
+        }),
+      );
+      const result = await this.elicitationCallback!(toolName, request, meta);
+      events.push(
+        this.makeEvent({
+          eventType: "elicitation_response",
+          data: { tool_name: toolName, result },
+          latencyMs: Date.now() - elicitStartedAt,
+        }),
+      );
+      return result;
+    };
+  }
+
+  private async executeToolRound(
+    toolCalls: OpenAIToolCall[],
+    events: EventPayload[],
+    overrides?: {
+      approvalCallback?: AgentOptions["approvalCallback"];
+      elicitationCallback?: (
+        toolName: string,
+        request: ElicitationRequest,
+        meta?: { toolCallId: string; args: Record<string, unknown> },
+      ) => Promise<ElicitationResult>;
+    },
+  ): Promise<void> {
+    const approvalCallback =
+      overrides?.approvalCallback ??
+      (this.interruptOnUserInput ? undefined : this.approvalCallback);
+    const elicitationCallback =
+      overrides?.elicitationCallback ?? this.makeElicitationCallback(events);
+
+    const batchStartedAt = Date.now();
+    let toolResults: Map<string, string>;
+    try {
+      toolResults = await this.tools.executeBatch(
+        toolCalls,
+        approvalCallback,
+        elicitationCallback,
+      );
+    } catch (error) {
+      if (
+        error instanceof AgentInterruptedError &&
+        error.completedToolResults &&
+        error.completedToolResults.size > 0
+      ) {
+        this.recordToolResults(
+          toolCalls,
+          error.completedToolResults,
+          events,
+          Date.now() - batchStartedAt,
+          false,
+        );
+      }
+      throw error;
+    }
+
+    this.recordToolResults(
+      toolCalls,
+      toolResults,
+      events,
+      Date.now() - batchStartedAt,
+      true,
+    );
+  }
+
+  private recordToolResults(
+    toolCalls: OpenAIToolCall[],
+    toolResults: Map<string, string>,
+    events: EventPayload[],
+    batchLatencyMs: number,
+    fillMissing: boolean,
+  ): void {
+    for (const toolCall of toolCalls) {
+      const result = toolResults.get(toolCall.id);
+      if (result == null) {
+        if (!fillMissing) continue;
+      }
+      const content =
+        result ?? jsonDumpsSafe({ error: "No result for tool_call_id" });
+      this.debug.logToolResult(toolCall.id, true, content);
+      let parsedResponse: unknown;
+      try {
+        parsedResponse = JSON.parse(content);
+      } catch {
+        parsedResponse = { raw: content };
+      }
+      events.push(
+        this.makeEvent({
+          eventType: "tool_call",
+          data: {
+            request: toolCall,
+            response: redactToolResultForLog(parsedResponse),
+          },
+          latencyMs: batchLatencyMs,
+        }),
+      );
+      const media = parseToolResultMedia(content);
+      // Keep the original payload when it includes a screenshot. A user image
+      // message cannot be inserted until every tool call in this turn has a
+      // result, or the provider rejects the history.
+      this.memory.append({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: media.imageMessage ? content : media.toolContent,
+      });
+      const denied =
+        !!parsedResponse &&
+        typeof parsedResponse === "object" &&
+        "error" in parsedResponse &&
+        typeof (parsedResponse as { error?: unknown }).error === "string" &&
+        (parsedResponse as { error: string }).error.includes(
+          "User denied approval",
+        );
+      let input: unknown = {};
+      try {
+        input = JSON.parse(toolCall.function.arguments || "{}");
+      } catch {
+        input = {};
+      }
+      this.onToolActivity?.({
+        type: "tool-result",
+        toolCallId: toolCall.id,
+        toolName: toolCall.function.name,
+        input,
+        output: media.imageMessage
+          ? { ok: true, text: "Screenshot attached.", image: true }
+          : parsedResponse,
+        denied,
+      });
+    }
+    this.flushScreenshotFollowUps();
+  }
+
+  /** Attach the latest screenshot only after the tool-call block is complete. */
+  private flushScreenshotFollowUps(): void {
+    if (this.findPendingToolCalls().length > 0) return;
+    const messages = this.memory.messages;
+    let latest: OpenAIInputContentPart[] | null = null;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i];
+      if (!message) continue;
+      if (message.role === "assistant" || message.role === "user") break;
+      if (message.role !== "tool" || typeof message.content !== "string") continue;
+      const media = parseToolResultMedia(message.content);
+      if (!media.imageMessage) continue;
+      message.content = media.toolContent;
+      if (!latest) latest = media.imageMessage;
+    }
+    if (!latest) return;
+    this.memory.dropScreenshotFollowUps();
+    this.memory.append({ role: "user", content: latest });
+  }
+
+  /** Shared LLM and tool loop used by {@link Agent.run} and {@link Agent.resume}. */
+  private async *runLoop(
+    events: EventPayload[],
+  ): AsyncGenerator<string> {
+    const openaiTools = this.tools.toOpenAITools();
+    let finishedNormally = false;
+    for (let round = 0; round < this.maxToolRounds; round += 1) {
+      const messages = await this.memory.buildMessagesForLLM(this.systemPrompt);
+      this.debug.logLLMRequest(this.model, messages.length, openaiTools.length);
+      const llmRequest = {
+        model: this.model,
+        messages: messages as any,
+        stream: true as const,
+        ...(openaiTools.length > 0 ? { tools: openaiTools } : {}),
+        ...(this.vendor === "openai" || this.vendor === "openrouter"
+          ? { stream_options: { include_usage: true } }
+          : {}),
+      };
+      const llmEventRequestData = {
+        model: this.model,
+        messages: this.extractLlmEventMessages(messages) as any,
+        stream: true,
+      };
+      const startedAt = Date.now();
+      const stream = (await this.client.chat.completions.create(
+        llmRequest as any,
+      )) as unknown as AsyncIterable<any>;
+
+      const contentParts: string[] = [];
+      const toolCallsMap = new Map<
+        number,
+        { id: string; name: string; arguments: string }
+      >();
+      let finishReason: string | null = null;
+      let llmTotalTokens = 0;
+      let llmUsage: Record<string, unknown> | null = null;
+
+      for await (const chunk of stream) {
+        if (chunk.usage) {
+          llmUsage = chunk.usage as Record<string, unknown>;
+          if (typeof chunk.usage.total_tokens === "number") {
+            llmTotalTokens = chunk.usage.total_tokens;
+          }
+        }
+        const choice = chunk.choices?.[0];
+        if (!choice) continue;
+        if (choice.finish_reason) finishReason = choice.finish_reason;
+        const delta = choice.delta;
+        if (!delta) continue;
+        if (delta.content) {
+          contentParts.push(delta.content);
+          yield delta.content;
+        }
+        for (const toolCall of delta.tool_calls ?? []) {
+          const index = toolCall.index ?? 0;
+          const existing = toolCallsMap.get(index) ?? {
+            id: "",
+            name: "",
+            arguments: "",
+          };
+          if (toolCall.id) existing.id = toolCall.id;
+          if (toolCall.function?.name) existing.name = toolCall.function.name;
+          if (toolCall.function?.arguments) {
+            existing.arguments += toolCall.function.arguments;
+          }
+          toolCallsMap.set(index, existing);
+        }
+      }
+
+      const assistantContent = contentParts.join("") || null;
+      const llmLatencyMs = Date.now() - startedAt;
+      const toolCalls = [...toolCallsMap.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([, call]): OpenAIToolCall => ({
+          id: call.id,
+          type: "function",
+          function: {
+            name: call.name,
+            arguments: call.arguments || "{}",
+          },
+        }));
+
+      events.push(
+        this.makeEvent({
+          eventType: "llm_call",
+          data: {
+            request: llmEventRequestData,
+            response: {
+              finish_reason: finishReason,
+              content: assistantContent,
+              tool_calls: toolCalls,
+              ...(llmUsage ? { usage: llmUsage } : {}),
+            },
+          },
+          tokens: llmTotalTokens,
+          latencyMs: llmLatencyMs,
+        }),
+      );
+
+      if (finishReason === "tool_calls" || toolCalls.length > 0) {
+        this.debug.logToolCalls(toolCalls);
+        this.memory.append({
+          role: "assistant",
+          content: assistantContent,
+          tool_calls: toolCalls,
+        });
+        if (this.interruptOnUserInput) {
+          const approvalInterrupts =
+            this.tools.collectApprovalInterrupts(toolCalls);
+          if (approvalInterrupts.length > 0) {
+            await this.flushEvents(events);
+            this.activeRunEvents = null;
+            throw new AgentInterruptedError(approvalInterrupts);
+          }
+        }
+        await this.executeToolRound(toolCalls, events);
+        continue;
+      }
+
+      this.memory.append({
+        role: "assistant",
+        content: assistantContent ?? "",
+      });
+      finishedNormally = true;
+      break;
+    }
+    if (!finishedNormally) {
+      throw new Error(
+        `Exceeded maxToolRounds (${this.maxToolRounds}); increase maxToolRounds or simplify the task.`,
+      );
     }
   }
 
