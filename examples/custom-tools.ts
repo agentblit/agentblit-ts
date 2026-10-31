@@ -33,7 +33,6 @@ async function main(): Promise<void> {
     apiKey: llmKey,
     agentblitUrl: process.env.AGENTBLIT_URL?.trim() || "https://console.agentblit.com",
     agentblitApiKey: agentblitKey,
-    maxHistory: 10,
     debug: true,
     customTools: [greet, doubleValue],
   });

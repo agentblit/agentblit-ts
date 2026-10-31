@@ -27,7 +27,7 @@ export interface AgentConfig {
   llmUrl: string;
   agentblitUrl: string;
   systemPrompt: string;
-  maxHistory: number;
+  contextBudgetTokens: number;
   debug: boolean;
   timeout: number;
   agentId: string;
@@ -177,7 +177,11 @@ export interface AgentOptions {
   model?: string;
   /** Optional session id used on `/api/1.0/tools/call` and analytics events. */
   sessionId?: string;
-  maxHistory?: number;
+  /**
+   * Approximate token budget for conversation memory (excluding system prompt).
+   * When exceeded, older turns are summarized in place. Default: 100_000.
+   */
+  contextBudgetTokens?: number;
   debug?: boolean;
   timeout?: number;
   approvalCallback?: ApprovalCallback;
@@ -214,6 +218,14 @@ export type AgentToolActivity = {
   output: unknown;
   /** True when the user denied approval and the tool did not run. */
   denied: boolean;
+  /**
+   * Images from the tool result that the host UI should show (e.g. computer
+   * screenshots when `share_with_user` is true). The model still receives
+   * images via memory; this is only for the chat surface.
+   */
+  media?: {
+    images: Array<{ mimeType: string; data: string }>;
+  };
 };
 
 /** Thrown when `interruptOnUserInput` is set and the agent needs a user decision. */

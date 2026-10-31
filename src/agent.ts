@@ -202,18 +202,18 @@ export class Agent {
   private readonly llmApiKey: string;
   private readonly modelOverride?: string;
   private readonly debugEnabled: boolean;
-  private readonly maxHistory: number;
+  private readonly contextBudgetTokens: number;
 
   constructor(options: AgentOptions) {
     const agentblitApiKey = options.agentblitApiKey.trim();
     if (!agentblitApiKey) {
       throw new Error("agentblitApiKey is required");
     }
-    const maxHistory = options.maxHistory ?? 10;
-    if (maxHistory < 1) {
-      throw new Error("maxHistory must be at least 1");
+    const contextBudgetTokens = options.contextBudgetTokens ?? 100_000;
+    if (contextBudgetTokens < 1_000) {
+      throw new Error("contextBudgetTokens must be at least 1000");
     }
-    const maxToolRounds = options.maxToolRounds ?? 25;
+    const maxToolRounds = options.maxToolRounds ?? 100;
     if (maxToolRounds < 1) {
       throw new Error("maxToolRounds must be at least 1");
     }
@@ -225,7 +225,7 @@ export class Agent {
     this.llmApiKey = options.apiKey;
     const modelOverride = options.model?.trim();
     this.modelOverride = modelOverride || undefined;
-    this.maxHistory = maxHistory;
+    this.contextBudgetTokens = contextBudgetTokens;
     this.debugEnabled = Boolean(options.debug);
     this.timeout = timeoutMs;
     this.approvalCallback = options.approvalCallback;
@@ -248,7 +248,7 @@ export class Agent {
       this.registerTool(customTool);
     }
     this.memory = new ChatMemory({
-      maxHistory,
+      contextBudgetTokens,
       summarizeFn: (older) => this.summarizeOlderMessages(older),
     });
   }
@@ -287,7 +287,7 @@ export class Agent {
       llmUrl: this.llmUrl,
       agentblitUrl: this.eventBaseUrl,
       systemPrompt: this.systemPrompt,
-      maxHistory: this.maxHistory,
+      contextBudgetTokens: this.contextBudgetTokens,
       debug: this.debugEnabled,
       timeout: this.timeout / 1000,
       agentId: this.agentId,
@@ -818,6 +818,21 @@ export class Agent {
       } catch {
         input = {};
       }
+      const shareWithUser =
+        !!input &&
+        typeof input === "object" &&
+        !Array.isArray(input) &&
+        (input as { share_with_user?: unknown }).share_with_user === true;
+      const images =
+        shareWithUser && media.imageMessage
+          ? media.imageMessage.flatMap((part) => {
+              if (part.type !== "image_url") return [];
+              const url = part.image_url.url;
+              const match = /^data:([^;]+);base64,(.+)$/s.exec(url);
+              if (!match?.[1] || !match[2]) return [];
+              return [{ mimeType: match[1], data: match[2] }];
+            })
+          : [];
       this.onToolActivity?.({
         type: "tool-result",
         toolCallId: toolCall.id,
@@ -827,6 +842,7 @@ export class Agent {
           ? { ok: true, text: "Screenshot attached.", image: true }
           : parsedResponse,
         denied,
+        ...(images.length > 0 ? { media: { images } } : {}),
       });
     }
     this.flushScreenshotFollowUps();
