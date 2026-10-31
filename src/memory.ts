@@ -94,14 +94,22 @@ export class ChatMemory {
     }
 
     const keepTokens = Math.max(
-      4_000,
+      1,
       Math.floor(this.contextBudgetTokens * KEEP_RATIO),
     );
-    let keepStart = findKeepStart(this.messagesStore, keepTokens);
-    keepStart = snapToSafeCut(this.messagesStore, keepStart);
+    let keepStart = snapToSafeCut(
+      this.messagesStore,
+      findKeepStart(this.messagesStore, keepTokens),
+    );
 
+    // If the recent window alone fills the budget, keep only the last turn.
+    if (keepStart <= 0 && this.messagesStore.length > 1) {
+      keepStart = snapToSafeCut(
+        this.messagesStore,
+        this.messagesStore.length - 1,
+      );
+    }
     if (keepStart <= 0) {
-      // Recent window alone is huge: shrink tool payloads in the whole store.
       this.messagesStore.splice(
         0,
         this.messagesStore.length,
@@ -235,7 +243,7 @@ function shrinkToolOutputs(messages: ChatMessage[]): ChatMessage[] {
  * Drop orphan tool results and unfinished tool_calls so the provider never
  * sees a broken tool pair (the HTTP 400 case).
  */
-export function repairToolPairing(messages: ChatMessage[]): ChatMessage[] {
+function repairToolPairing(messages: ChatMessage[]): ChatMessage[] {
   const declared = new Set<string>();
   for (const message of messages) {
     for (const id of toolCallIds(message)) declared.add(id);
