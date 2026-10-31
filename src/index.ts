@@ -1,7 +1,8 @@
 export { Agent } from "./agent.js";
-export { ChatMemory } from "./memory.js";
+export { ChatMemory, repairToolPairing } from "./memory.js";
 export { tool, ToolRegistry } from "./tools.js";
 export { AgentInterruptedError } from "./types.js";
+export type { ChatMemoryOptions } from "./memory.js";
 export type {
   AgentBlitAgentConfig,
   AgentConfig,

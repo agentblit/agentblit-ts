@@ -76,8 +76,8 @@ for await (const chunk of agent.run(input)) {
 | `apiKey` | `string` | Yes | - | LLM provider API key | Send model requests |
 | `agentblitApiKey` | `string` | Yes | - | AgentBlit API key (`X-API-Key`) | Load agent config + remote tools + analytics events |
 | `agentblitUrl` | `string` | No | `https://console.agentblit.com` | Valid base URL | Self-hosted or staging AgentBlit |
-| `maxHistory` | `number` | No | `10` | Integer `>= 1` | Keep recent messages before summarization |
-| `maxToolRounds` | `number` | No | `25` | Integer `>= 1` | Limit LLM-tool loop iterations |
+| `contextBudgetTokens` | `number` | No | `100000` | Integer `>= 1000` | Token budget for memory; older turns are summarized in place when exceeded |
+| `maxToolRounds` | `number` | No | `100` | Integer `>= 1` | Limit LLM-tool loop iterations |
 | `debug` | `boolean` | No | `false` | `true` or `false` | Enable verbose SDK logs |
 | `model` | `string` | No | AgentBlit agent model | `vendor/model`, e.g. `openai/gpt-4o-mini` | Override the model loaded from AgentBlit |
 | `sessionId` | `string` | No | random UUID | Non-empty string | Reuse a session on tool calls and analytics events |
@@ -100,7 +100,7 @@ for await (const chunk of agent.run(input)) {
 - Streaming text responses with `for await (const chunk of agent.run(...))`
 - Non-streaming completion via `await agent.runSync(...)`
 - Multi-round tool calling in one `run()`
-- Memory summarization using `maxHistory`
+- Persistent memory compaction using `contextBudgetTokens` (safe tool-call boundaries)
 - Default system guidance to use tools and available long-term memory tools (`retrieveRelevantMemory`, `updateMemory`) when needed
 - Automatic analytics batching (`agent_init`, `user_prompt`, `llm_call`, `tool_call`, `elicitation_request`, `elicitation_response`, `tools_updated`, `agent_loop_error`)
 - Custom analytics via `agent.track(eventType, properties)`

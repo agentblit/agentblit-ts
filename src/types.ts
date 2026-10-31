@@ -27,7 +27,7 @@ export interface AgentConfig {
   llmUrl: string;
   agentblitUrl: string;
   systemPrompt: string;
-  maxHistory: number;
+  contextBudgetTokens: number;
   debug: boolean;
   timeout: number;
   agentId: string;
@@ -177,7 +177,11 @@ export interface AgentOptions {
   model?: string;
   /** Optional session id used on `/api/1.0/tools/call` and analytics events. */
   sessionId?: string;
-  maxHistory?: number;
+  /**
+   * Approximate token budget for conversation memory (excluding system prompt).
+   * When exceeded, older turns are summarized in place. Default: 100_000.
+   */
+  contextBudgetTokens?: number;
   debug?: boolean;
   timeout?: number;
   approvalCallback?: ApprovalCallback;
