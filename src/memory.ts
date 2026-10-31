@@ -240,10 +240,23 @@ function shrinkToolOutputs(messages: ChatMessage[]): ChatMessage[] {
 }
 
 /**
- * Drop orphan tool results and unfinished tool_calls so the provider never
- * sees a broken tool pair (the HTTP 400 case).
+ * Drop orphan tool results and stale unfinished tool_calls so the provider
+ * never sees a broken tool pair (the HTTP 400 case).
+ *
+ * Trailing incomplete assistant tool_calls are kept: interrupt/resume leaves
+ * pending calls (and any same-batch results already written) at the end of
+ * memory, and {@link ChatMemory.replace} must restore that state intact.
  */
 function repairToolPairing(messages: ChatMessage[]): ChatMessage[] {
+  let lastTurnIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const role = messages[i]?.role;
+    if (role === "user" || role === "assistant") {
+      lastTurnIndex = i;
+      break;
+    }
+  }
+
   const declared = new Set<string>();
   for (const message of messages) {
     for (const id of toolCallIds(message)) declared.add(id);
@@ -257,7 +270,10 @@ function repairToolPairing(messages: ChatMessage[]): ChatMessage[] {
   }
 
   const out: ChatMessage[] = [];
-  for (const message of messages) {
+  for (let i = 0; i < messages.length; i += 1) {
+    const message = messages[i];
+    if (!message) continue;
+
     if (isToolResult(message)) {
       const id = message.tool_call_id;
       if (typeof id !== "string" || !declared.has(id)) continue;
@@ -271,14 +287,22 @@ function repairToolPairing(messages: ChatMessage[]): ChatMessage[] {
       continue;
     }
 
-    // Keep the assistant tool_calls only if every id has a result.
+    // Fully answered tool round.
     if (ids.every((id) => answered.has(id))) {
       out.push(message);
       continue;
     }
 
-    // Incomplete tool round (e.g. interrupted mid-batch): drop the assistant
-    // tool_calls message; its orphan results were already skipped above.
+    // Pending interrupt / partial batch at the end of memory — keep it so
+    // resume() and getPendingToolCalls() still see the open tool_calls.
+    if (i === lastTurnIndex) {
+      out.push(message);
+      continue;
+    }
+
+    // Stale incomplete round earlier in history (host forgot to close
+    // dangling calls before a new user turn): drop it; orphan results for
+    // those ids are removed in the filter below.
   }
 
   // Recompute declared from kept assistants and drop any leftover orphans.
