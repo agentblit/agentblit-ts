@@ -26,6 +26,12 @@ export class ChatMemory {
     this.messagesStore.push(...messages);
   }
 
+  /** Replace the entire message store (e.g. restore a persisted thread). */
+  replace(messages: ChatMessage[]): void {
+    this.messagesStore.length = 0;
+    this.messagesStore.push(...messages);
+  }
+
   clear(): void {
     this.messagesStore.length = 0;
   }

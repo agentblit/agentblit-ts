@@ -37,7 +37,31 @@ export interface AgentConfig {
 export type ApprovalCallback = (
   toolName: string,
   args: Record<string, unknown>,
+  meta?: { toolCallId: string },
 ) => Promise<boolean>;
+
+/** One user decision needed before the agent loop can continue. */
+export type AgentInterrupt = {
+  id: string;
+  kind: "approval" | "elicitation";
+  toolCallId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  elicitation?: ElicitationRequest;
+};
+
+/** Decision that unblocks an {@link AgentInterrupt}. */
+export type AgentInterruptDecision =
+  | {
+      toolCallId: string;
+      kind: "approval";
+      approved: boolean;
+    }
+  | {
+      toolCallId: string;
+      kind: "elicitation";
+      result: ElicitationResult;
+    };
 
 /**
  * A flat JSON Schema property as defined in the MCP elicitation spec
@@ -88,6 +112,7 @@ export interface ElicitationResult {
 export type ElicitationCallback = (
   toolName: string,
   request: ElicitationRequest,
+  meta?: { toolCallId: string; args: Record<string, unknown> },
 ) => Promise<ElicitationResult>;
 
 export type SummarizeFn = (messages: ChatMessage[]) => Promise<string>;
@@ -163,8 +188,52 @@ export interface AgentOptions {
    * automatically cancelled so the connector can handle the absent-user case.
    */
   elicitationCallback?: ElicitationCallback;
+  /**
+   * When true, tool approval and elicitation stop the run instead of waiting on
+   * callbacks. {@link Agent.run} / {@link Agent.resume} throw
+   * {@link AgentInterruptedError}; call {@link Agent.resume} with decisions to continue.
+   * Callbacks are ignored in this mode.
+   */
+  interruptOnUserInput?: boolean;
+  /**
+   * Fired after each tool call is written to memory. Hosts that stream a chat UI
+   * use this to emit tool parts. Approval and elicitation interrupts are not
+   * reported here; they throw {@link AgentInterruptedError} instead.
+   */
+  onToolActivity?: (activity: AgentToolActivity) => void;
   customTools?: ToolHandler[];
   maxToolRounds?: number;
+}
+
+/** A tool call that finished and was appended to memory. */
+export type AgentToolActivity = {
+  type: "tool-result";
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
+  output: unknown;
+  /** True when the user denied approval and the tool did not run. */
+  denied: boolean;
+};
+
+/** Thrown when `interruptOnUserInput` is set and the agent needs a user decision. */
+export class AgentInterruptedError extends Error {
+  readonly interrupts: AgentInterrupt[];
+  /**
+   * Results for tool calls in the same batch that finished before this interrupt.
+   * `resume()` persists these before rethrowing so they are not executed again.
+   */
+  completedToolResults?: Map<string, string>;
+
+  constructor(interrupts: AgentInterrupt[]) {
+    super(
+      interrupts.length === 1
+        ? `Agent interrupted: ${interrupts[0]!.kind} required for ${interrupts[0]!.toolName}`
+        : `Agent interrupted: ${interrupts.length} user decisions required`,
+    );
+    this.name = "AgentInterruptedError";
+    this.interrupts = interrupts;
+  }
 }
 
 export interface ToolOptions {

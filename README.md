@@ -82,8 +82,9 @@ for await (const chunk of agent.run(input)) {
 | `model` | `string` | No | AgentBlit agent model | `vendor/model`, e.g. `openai/gpt-4o-mini` | Override the model loaded from AgentBlit |
 | `sessionId` | `string` | No | random UUID | Non-empty string | Reuse a session on tool calls and analytics events |
 | `timeout` | `number` (seconds) | No | `30` | Positive number | Control HTTP timeout for LLM + AgentBlit |
-| `approvalCallback` | `async (toolName, args) => boolean` | No | terminal prompt | Async function | Approve/reject `needs_approval` tools |
-| `elicitationCallback` | `async (toolName, request) => ElicitationResult` | No | auto-cancel | Async function | Answer mid-tool user-input requests from MCP or HTTP connectors |
+| `approvalCallback` | `async (toolName, args, meta?) => boolean` | No | terminal prompt | Async function | Approve/reject `needs_approval` tools |
+| `elicitationCallback` | `async (toolName, request, meta?) => ElicitationResult` | No | auto-cancel | Async function | Answer mid-tool user-input requests from MCP or HTTP connectors |
+| `interruptOnUserInput` | `boolean` | No | `false` | `true` or `false` | Stop the run on approval/elicitation instead of waiting; use `resume()` |
 | `customTools` | `ToolHandler[]` | No | `[]` | Local tool functions | Register app-specific local tools |
 
 ---
@@ -135,6 +136,46 @@ const agent = new Agent({
     return toolName !== "delete_production_data";
   },
 });
+```
+
+### Example 2b: Interrupt and resume (HTTP chat hosts)
+
+When `interruptOnUserInput` is true, approval/elicitation **end the run** instead of
+blocking. Persist `agent.memory.messages`, then call `resume()` with decisions.
+`getPendingToolCalls()` lists calls that still need a result.
+`closeDanglingToolCalls()` writes a tool result for any call the user skipped,
+so a later user message is valid for the model. Tool results that finished
+before an elicitation interrupt stay in memory; `resume()` does not run them again.
+
+```ts
+import { Agent, AgentInterruptedError } from "agentblit";
+
+const agent = new Agent({
+  apiKey: process.env.LLM_API_KEY ?? "",
+  agentblitApiKey: process.env.AGENTBLIT_API_KEY ?? "",
+  interruptOnUserInput: true,
+});
+
+try {
+  for await (const chunk of agent.run("Delete the staging database")) {
+    process.stdout.write(chunk);
+  }
+} catch (error) {
+  if (error instanceof AgentInterruptedError) {
+    // Save agent.memory.messages, return interrupts to the UI, then later:
+    for await (const chunk of agent.resume(
+      error.interrupts.map((item) => ({
+        toolCallId: item.toolCallId,
+        kind: "approval" as const,
+        approved: false,
+      })),
+    )) {
+      process.stdout.write(chunk);
+    }
+  } else {
+    throw error;
+  }
+}
 ```
 
 ### Example 3: Elicitation and `runSync`
