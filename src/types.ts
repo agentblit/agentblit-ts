@@ -214,6 +214,14 @@ export type AgentToolActivity = {
   output: unknown;
   /** True when the user denied approval and the tool did not run. */
   denied: boolean;
+  /**
+   * Images from the tool result that the host UI should show (e.g. computer
+   * screenshots when `share_with_user` is true). The model still receives
+   * images via memory; this is only for the chat surface.
+   */
+  media?: {
+    images: Array<{ mimeType: string; data: string }>;
+  };
 };
 
 /** Thrown when `interruptOnUserInput` is set and the agent needs a user decision. */

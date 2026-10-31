@@ -818,6 +818,21 @@ export class Agent {
       } catch {
         input = {};
       }
+      const shareWithUser =
+        !!input &&
+        typeof input === "object" &&
+        !Array.isArray(input) &&
+        (input as { share_with_user?: unknown }).share_with_user === true;
+      const images =
+        shareWithUser && media.imageMessage
+          ? media.imageMessage.flatMap((part) => {
+              if (part.type !== "image_url") return [];
+              const url = part.image_url.url;
+              const match = /^data:([^;]+);base64,(.+)$/s.exec(url);
+              if (!match?.[1] || !match[2]) return [];
+              return [{ mimeType: match[1], data: match[2] }];
+            })
+          : [];
       this.onToolActivity?.({
         type: "tool-result",
         toolCallId: toolCall.id,
@@ -827,6 +842,7 @@ export class Agent {
           ? { ok: true, text: "Screenshot attached.", image: true }
           : parsedResponse,
         denied,
+        ...(images.length > 0 ? { media: { images } } : {}),
       });
     }
     this.flushScreenshotFollowUps();
